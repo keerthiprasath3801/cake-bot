@@ -14,7 +14,12 @@ const twilioClient = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
-const serviceAccount = require('./firebase-key.json');
+let serviceAccount;
+if (process.env.FIREBASE_KEY_JSON) {
+  serviceAccount = JSON.parse(process.env.FIREBASE_KEY_JSON);
+} else {
+  serviceAccount = require('./firebase-key.json');
+}
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
@@ -55,7 +60,7 @@ const QUESTIONS = {
 // ── INCOMING WHATSAPP MESSAGES ───────────────────────────────
 
 app.post('/webhook', async (req, res) => {
-   res.status(200).end();
+  res.status(200).end();
 
   const from = req.body.From?.replace('whatsapp:+', '');
   const text = req.body.Body?.trim();
@@ -93,7 +98,7 @@ app.post('/webhook', async (req, res) => {
     // ── FIRST MESSAGE — GREET CUSTOMER ──
     if (s.step === 0) {
       await send(from,
-        'Welcome to *velvet Cake Shop!*\n\n' +
+        'Welcome to *Velvet Cake Shop!*\n\n' +
         'I am here to help you place your cake order.\n' +
         'It will only take a minute!\n\n' +
         QUESTIONS.kg
@@ -173,7 +178,7 @@ async function placeOrder(phone, order) {
     'Order ID: *' + orderId + '*\n\n' +
     'We will contact you shortly for payment.\n\n' +
     'You will receive updates on WhatsApp as your cake gets ready!\n\n' +
-    'Thank you for choosing Sweet Layers!'
+    'Thank you for choosing Velvet Cake Shop!'
   );
 
   await notifySeller(phone, order, false, orderId);
