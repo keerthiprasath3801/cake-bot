@@ -26,31 +26,64 @@ const STEPS = ['kg', 'flavour', 'date', 'time', 'cake_text', 'custom_design'];
 
 const QUESTIONS = {
   kg:
-    'How many kg do you need?\n(e.g. 1 kg, 1.5 kg, 2 kg)',
-
+    'How many kg do you need?\n(e.g. 1, 1.5, 2)',
   flavour:
     'What flavour would you like?\n\n' +
-    '- Chocolate\n' +
-    '- Vanilla\n' +
-    '- Strawberry\n' +
-    '- Red Velvet\n' +
-    '- Butterscotch\n\n' +
-    '(Type your choice or any other flavour)',
-
+    '1. Chocolate\n' +
+    '2. Vanilla\n' +
+    '3. Strawberry\n' +
+    '4. Red Velvet\n' +
+    '5. Butterscotch\n\n' +
+    'Type your choice from the list or any other flavour.',
   date:
     'What is the delivery date?\n(e.g. 25 March 2026)',
-
   time:
     'What time should we deliver?\n(e.g. 6:00 PM)',
-
   cake_text:
-    'What should we write on the cake?\n\nType the message or type NONE if you don\'t want anything written.',
-
+    'What should we write on the cake?\n\nType your message or type NONE if nothing.',
   custom_design:
-    'Do you need a custom cake design?\n\n' +
-    'Reply *YES* - if you want a special design, our team will contact you personally.\n' +
-    'Reply *NO*  - to continue with standard finish.'
+    'Do you need a custom cake design?\n\nReply *YES* or *NO*'
 };
+
+// ── VALIDATION ───────────────────────────────────────────────
+
+function validate(key, value) {
+  switch (key) {
+    case 'kg':
+      return !isNaN(parseFloat(value)) && parseFloat(value) > 0;
+    case 'flavour':
+      return value.length >= 2;
+    case 'date':
+      return value.length >= 4;
+    case 'time':
+      return value.length >= 3;
+    case 'cake_text':
+      return value.length >= 1;
+    case 'custom_design':
+      return ['YES', 'NO'].includes(value.toUpperCase());
+    default:
+      return true;
+  }
+}
+
+function validationError(key) {
+  switch (key) {
+    case 'kg':
+      return 'Please enter a valid weight in kg.\n(e.g. 1, 1.5, 2)';
+    case 'flavour':
+      return 'Please type a valid flavour name.';
+    case 'date':
+      return 'Please enter a valid delivery date.\n(e.g. 25 March 2026)';
+    case 'time':
+      return 'Please enter a valid delivery time.\n(e.g. 6:00 PM)';
+    case 'cake_text':
+      return 'Please type the message for the cake or type NONE.';
+    case 'custom_design':
+      return 'Please reply with *YES* or *NO* only.';
+    default:
+      return 'Invalid input. Please try again.';
+  }
+}
 
 // ── INCOMING WHATSAPP MESSAGES ───────────────────────────────
 
@@ -78,13 +111,13 @@ app.post('/webhook', async (req, res) => {
       } else if (reply === 'CANCEL') {
         await send(from,
           'Your order has been cancelled.\n\n' +
-          'Send any message to start a new order anytime!'
+          'Send any message to start a new order!'
         );
         delete sessions[from];
 
       } else {
         await send(from,
-          'Please reply *CONFIRM* to place your order\nor *CANCEL* to cancel.'
+          'Please reply *CONFIRM* to place your order or *CANCEL* to cancel.'
         );
       }
       return;
@@ -93,9 +126,8 @@ app.post('/webhook', async (req, res) => {
     // ── FIRST MESSAGE — GREET CUSTOMER ──
     if (s.step === 0) {
       await send(from,
-        'Welcome to *Velvet Cake Shop!*\n\n' +
-        'I am here to help you place your cake order.\n' +
-        'It will only take a minute!\n\n' +
+        'Welcome to *Velvet Cakes!*\n\n' +
+        'I will help you place your cake order in just a few steps.\n\n' +
         QUESTIONS.kg
       );
       s.step = 1;
@@ -104,15 +136,22 @@ app.post('/webhook', async (req, res) => {
 
     // ── COLLECT ORDER DETAILS ──
     const key = STEPS[s.step - 1];
+
+    // Validate input before moving forward
+    if (!validate(key, text)) {
+      await send(from, validationError(key));
+      return;
+    }
+
     s.order[key] = text;
 
     // Custom design → hand off to seller
     if (key === 'custom_design' && text.toUpperCase() === 'YES') {
       await send(from,
-        'Our cake designer will contact you shortly to discuss your design!\n\n' +
-        'You can also reach us directly here:\n' +
+        'Our cake designer will contact you to discuss your custom design!\n\n' +
+        'You can also reach us directly:\n' +
         'https://wa.me/' + process.env.SELLER_PHONE + '\n\n' +
-        'Your other order details have been saved. We will confirm everything after the design discussion.'
+        'Your other order details have been saved.'
       );
       await notifySeller(from, s.order, true);
       delete sessions[from];
@@ -125,7 +164,7 @@ app.post('/webhook', async (req, res) => {
       s.step++;
 
     } else {
-      // All questions answered — show order summary
+      // All questions done — show summary
       const o = s.order;
       const priceEst = (parseFloat(o.kg) * parseInt(process.env.PRICE_PER_KG)).toFixed(0);
 
@@ -172,8 +211,8 @@ async function placeOrder(phone, order) {
     'Your order is confirmed!\n\n' +
     'Order ID: *' + orderId + '*\n\n' +
     'We will contact you shortly for payment.\n\n' +
-    'You will receive updates on WhatsApp as your cake gets ready!\n\n' +
-    'Thank you for choosing Velvet Cake Shop!'
+    'You will receive updates as your cake gets ready!\n\n' +
+    'Thank you for choosing Velvet Cakes!'
   );
 
   await notifySeller(phone, order, false, orderId);
@@ -186,14 +225,14 @@ async function notifySeller(phone, order, isCustom, orderId = '') {
 
   if (isCustom) {
     msg =
-      'NEW CUSTOM ORDER REQUEST\n\n' +
+      'NEW CUSTOM ORDER\n\n' +
       'Customer  : +' + phone + '\n' +
       'Kg        : ' + order.kg + '\n' +
       'Flavour   : ' + order.flavour + '\n' +
       'Date      : ' + order.date + '\n' +
       'Time      : ' + order.time + '\n' +
       'On cake   : ' + order.cake_text + '\n\n' +
-      'Please contact the customer to discuss their custom design.';
+      'Contact the customer for custom design.';
   } else {
     msg =
       'NEW ORDER CONFIRMED\n\n' +
@@ -224,13 +263,13 @@ async function send(to, body) {
 async function sendTrackingUpdate(orderId, status) {
   const messages = {
     baking:
-      'Your cake is being baked right now with love!',
+      'Your cake is being baked right now!',
     decorating:
       'We are adding the final decorations to your cake!',
     dispatched:
-      'Your cake is out for delivery! It will reach you very soon.',
+      'Your cake is out for delivery! It will reach you soon.',
     delivered:
-      'Your cake has been delivered!\n\nEnjoy every bite! Thank you for choosing Velvet Cake Shop.'
+      'Your cake has been delivered!\n\nEnjoy every bite! Thank you for choosing Velvet Cakes.'
   };
 
   const doc = await db.collection('orders').doc(orderId).get();
