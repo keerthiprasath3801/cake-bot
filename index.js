@@ -1,0 +1,261 @@
+require('dotenv').config();
+const express = require('express');
+const twilio  = require('twilio');
+const admin   = require('firebase-admin');
+
+const app = express();
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+
+// ── INITIALISE SERVICES ──────────────────────────────────────
+
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+
+let serviceAccount;
+if (process.env.FIREBASE_KEY_JSON) {
+  serviceAccount = JSON.parse(process.env.FIREBASE_KEY_JSON);
+} else {
+  serviceAccount = require('./firebase-key.json');
+}
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+const db = admin.firestore();
+
+// ── ORDER FLOW SETUP ─────────────────────────────────────────
+
+const sessions = {};
+
+const STEPS = ['kg', 'flavour', 'date', 'time', 'cake_text', 'custom_design'];
+
+const QUESTIONS = {
+  kg:
+    'How many kg do you need?\n(e.g. 1 kg, 1.5 kg, 2 kg)',
+
+  flavour:
+    'What flavour would you like?\n\n' +
+    '- Chocolate\n' +
+    '- Vanilla\n' +
+    '- Strawberry\n' +
+    '- Red Velvet\n' +
+    '- Butterscotch\n\n' +
+    '(Type your choice or any other flavour)',
+
+  date:
+    'What is the delivery date?\n(e.g. 25 March 2026)',
+
+  time:
+    'What time should we deliver?\n(e.g. 6:00 PM)',
+
+  cake_text:
+    'What should we write on the cake?\n\nType the message or type NONE if you don\'t want anything written.',
+
+  custom_design:
+    'Do you need a custom cake design?\n\n' +
+    'Reply *YES* - if you want a special design, our team will contact you personally.\n' +
+    'Reply *NO*  - to continue with standard finish.'
+};
+
+// ── INCOMING WHATSAPP MESSAGES ───────────────────────────────
+
+app.post('/webhook', async (req, res) => {
+  res.sendStatus(200);
+
+  const from = req.body.From?.replace('whatsapp:+', '');
+  const text = req.body.Body?.trim();
+
+  if (!from || !text) return;
+
+  if (!sessions[from]) sessions[from] = { step: 0, order: {} };
+  const s = sessions[from];
+
+  try {
+
+    // ── WAITING FOR CONFIRM OR CANCEL ──
+    if (s.step === 'confirm') {
+      const reply = text.toUpperCase();
+
+      if (reply === 'CONFIRM') {
+        await placeOrder(from, s.order);
+        delete sessions[from];
+
+      } else if (reply === 'CANCEL') {
+        await send(from,
+          'Your order has been cancelled.\n\n' +
+          'Send any message to start a new order anytime!'
+        );
+        delete sessions[from];
+
+      } else {
+        await send(from,
+          'Please reply *CONFIRM* to place your order\nor *CANCEL* to cancel.'
+        );
+      }
+      return;
+    }
+
+    // ── FIRST MESSAGE — GREET CUSTOMER ──
+    if (s.step === 0) {
+      await send(from,
+        'Welcome to *velvet Cake Shop!*\n\n' +
+        'I am here to help you place your cake order.\n' +
+        'It will only take a minute!\n\n' +
+        QUESTIONS.kg
+      );
+      s.step = 1;
+      return;
+    }
+
+    // ── COLLECT ORDER DETAILS ──
+    const key = STEPS[s.step - 1];
+    s.order[key] = text;
+
+    // Custom design → hand off to seller
+    if (key === 'custom_design' && text.toUpperCase() === 'YES') {
+      await send(from,
+        'Our cake designer will contact you shortly to discuss your design!\n\n' +
+        'You can also reach us directly here:\n' +
+        'https://wa.me/' + process.env.SELLER_PHONE + '\n\n' +
+        'Your other order details have been saved. We will confirm everything after the design discussion.'
+      );
+      await notifySeller(from, s.order, true);
+      delete sessions[from];
+      return;
+    }
+
+    // Move to next question
+    if (s.step < STEPS.length) {
+      await send(from, QUESTIONS[STEPS[s.step]]);
+      s.step++;
+
+    } else {
+      // All questions answered — show order summary
+      const o = s.order;
+      const priceEst = (parseFloat(o.kg) * parseInt(process.env.PRICE_PER_KG)).toFixed(0);
+
+      await send(from,
+        'Here is your order summary:\n\n' +
+        'Cake weight  : ' + o.kg + ' kg\n' +
+        'Flavour      : ' + o.flavour + '\n' +
+        'Delivery date: ' + o.date + '\n' +
+        'Delivery time: ' + o.time + '\n' +
+        'Text on cake : ' + o.cake_text + '\n' +
+        'Custom design: No\n\n' +
+        'Estimated price: Rs.' + priceEst + '\n\n' +
+        'Reply *CONFIRM* to place your order\n' +
+        'Reply *CANCEL* to start over'
+      );
+      s.step = 'confirm';
+    }
+
+  } catch (err) {
+    console.error('Error:', err.message);
+    await send(from, 'Sorry, something went wrong. Please send any message to try again.');
+  }
+});
+
+// ── PLACE CONFIRMED ORDER ────────────────────────────────────
+
+async function placeOrder(phone, order) {
+  const orderId = 'CAKE' + Date.now();
+
+  await db.collection('orders').doc(orderId).set({
+    orderId,
+    customer:      phone,
+    kg:            order.kg,
+    flavour:       order.flavour,
+    date:          order.date,
+    time:          order.time,
+    cake_text:     order.cake_text,
+    custom_design: false,
+    status:        'received',
+    createdAt:     new Date()
+  });
+
+  await send(phone,
+    'Your order is confirmed!\n\n' +
+    'Order ID: *' + orderId + '*\n\n' +
+    'We will contact you shortly for payment.\n\n' +
+    'You will receive updates on WhatsApp as your cake gets ready!\n\n' +
+    'Thank you for choosing Sweet Layers!'
+  );
+
+  await notifySeller(phone, order, false, orderId);
+}
+
+// ── NOTIFY SELLER ────────────────────────────────────────────
+
+async function notifySeller(phone, order, isCustom, orderId = '') {
+  let msg;
+
+  if (isCustom) {
+    msg =
+      'NEW CUSTOM ORDER REQUEST\n\n' +
+      'Customer  : +' + phone + '\n' +
+      'Kg        : ' + order.kg + '\n' +
+      'Flavour   : ' + order.flavour + '\n' +
+      'Date      : ' + order.date + '\n' +
+      'Time      : ' + order.time + '\n' +
+      'On cake   : ' + order.cake_text + '\n\n' +
+      'Please contact the customer to discuss their custom design.';
+  } else {
+    msg =
+      'NEW ORDER CONFIRMED\n\n' +
+      'Order ID  : ' + orderId + '\n' +
+      'Customer  : +' + phone + '\n' +
+      'Kg        : ' + order.kg + '\n' +
+      'Flavour   : ' + order.flavour + '\n' +
+      'Date      : ' + order.date + '\n' +
+      'Time      : ' + order.time + '\n' +
+      'On cake   : ' + order.cake_text;
+  }
+
+  await send(process.env.SELLER_PHONE, msg);
+}
+
+// ── SEND WHATSAPP MESSAGE ────────────────────────────────────
+
+async function send(to, body) {
+  await twilioClient.messages.create({
+    from: 'whatsapp:' + process.env.TWILIO_WHATSAPP_NUMBER,
+    to:   'whatsapp:+' + to,
+    body
+  });
+}
+
+// ── TRACKING UPDATES ─────────────────────────────────────────
+
+async function sendTrackingUpdate(orderId, status) {
+  const messages = {
+    baking:
+      'Your cake is being baked right now with love!',
+    decorating:
+      'We are adding the final decorations to your cake!',
+    dispatched:
+      'Your cake is out for delivery! It will reach you very soon.',
+    delivered:
+      'Your cake has been delivered!\n\nEnjoy every bite! Thank you for choosing Velvet Cake Shop.'
+  };
+
+  const doc = await db.collection('orders').doc(orderId).get();
+
+  if (!doc.exists) {
+    console.log('Order not found:', orderId);
+    return;
+  }
+
+  await db.collection('orders').doc(orderId).update({
+    status,
+    updatedAt: new Date()
+  });
+
+  await send(doc.data().customer, messages[status]);
+  console.log('Tracking update sent —', orderId, '—', status);
+}
+
+// ── START SERVER ─────────────────────────────────────────────
+
+app.listen(3000, () => console.log('Cake bot running on port 3000'));
+
+module.exports = { sendTrackingUpdate };
